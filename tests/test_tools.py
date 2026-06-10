@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -434,6 +435,43 @@ class TestGetDocsSection:
 
         assert result["status"] == "ok"
         assert result["content"] == "packaged docs"
+
+
+class TestEmbedGraphProviderErrors:
+    """embed_graph must surface provider errors as structured responses,
+    never as a traceback, and must always close its GraphStore."""
+
+    def test_unknown_provider_returns_structured_error(self, tmp_path):
+        (tmp_path / ".code-review-graph").mkdir()
+        result = docs_module.embed_graph(
+            repo_root=str(tmp_path), provider="voyage",
+        )
+        assert result["status"] == "error"
+        assert "Unknown embedding provider" in result["error"]
+        assert "voyage" in result["error"]
+        assert "Valid: local, openai, google, minimax" in result["error"]
+
+    def test_missing_env_vars_return_structured_error(self, tmp_path, monkeypatch):
+        (tmp_path / ".code-review-graph").mkdir()
+        for var in ("CRG_OPENAI_API_KEY", "CRG_OPENAI_BASE_URL", "CRG_OPENAI_MODEL"):
+            monkeypatch.delenv(var, raising=False)
+        result = docs_module.embed_graph(
+            repo_root=str(tmp_path), provider="openai",
+        )
+        assert result["status"] == "error"
+        assert "CRG_OPENAI_API_KEY" in result["error"]
+
+    def test_store_closed_when_provider_unknown(self, tmp_path, monkeypatch):
+        (tmp_path / ".code-review-graph").mkdir()
+        store = MagicMock()
+        monkeypatch.setattr(
+            docs_module, "_get_store", lambda repo_root=None: (store, tmp_path),
+        )
+        result = docs_module.embed_graph(
+            repo_root=str(tmp_path), provider="voyage",
+        )
+        assert result["status"] == "error"
+        store.close.assert_called_once()
 
 
 class TestFindLargeFunctions:
