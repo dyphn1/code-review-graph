@@ -8,7 +8,7 @@ from typing import Any
 
 from ..embeddings import EmbeddingStore, embed_all_nodes
 from ..incremental import find_project_root, get_db_path
-from ._common import _get_store, _validate_repo_root
+from ._common import _get_store, _resolve_root, _validate_repo_root
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +257,7 @@ def get_wiki_page_func(
     from ..incremental import get_data_dir
     from ..wiki import get_wiki_page
 
-    _, root = _get_store(repo_root)
+    root = _resolve_root(repo_root)
     wiki_dir = get_data_dir(root) / "wiki"
     content = get_wiki_page(wiki_dir, community_name)
     if content is None:
