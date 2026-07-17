@@ -154,6 +154,14 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "format": "object",
         "needs_type": True,
     },
+    "codebuddy": {
+        "name": "CodeBuddy Code",
+        "config_path": lambda root: root / ".mcp.json",
+        "key": "mcpServers",
+        "detect": lambda: True,
+        "format": "object",
+        "needs_type": True,
+    },
 }
 
 
@@ -416,11 +424,30 @@ def install_platform_configs(
     Returns:
         List of platform names that were configured.
     """
+    shared_aliases: dict[str, tuple[str, ...]] = {}
     if target == "all":
         platforms_to_install = {k: v for k, v in PLATFORMS.items() if v["detect"]()}
         # Workspace-level Kiro detection
         if "kiro" not in platforms_to_install and (repo_root / ".kiro").is_dir():
             platforms_to_install["kiro"] = PLATFORMS["kiro"]
+
+        # Claude Code and CodeBuddy intentionally share the official project
+        # .mcp.json/mcpServers contract. Process that exact pair once, but do
+        # not deduplicate arbitrary clients merely because a config path
+        # happens to match: their keys or entry schemas may differ.
+        claude = platforms_to_install.get("claude")
+        codebuddy = platforms_to_install.get("codebuddy")
+        if claude is not None and codebuddy is not None:
+            same_contract = (
+                claude["config_path"](repo_root) == codebuddy["config_path"](repo_root)
+                and all(
+                    claude[field] == codebuddy[field]
+                    for field in ("key", "format", "needs_type")
+                )
+            )
+            if same_contract:
+                shared_aliases["claude"] = ("codebuddy",)
+                del platforms_to_install["codebuddy"]
     else:
         if target not in PLATFORMS:
             logger.error("Unknown platform: %s", target)
@@ -428,6 +455,10 @@ def install_platform_configs(
         platforms_to_install = {target: PLATFORMS[target]}
 
     configured: list[str] = []
+
+    def _record_configured(key: str, plat: dict[str, Any]) -> None:
+        configured.append(plat["name"])
+        configured.extend(PLATFORMS[alias]["name"] for alias in shared_aliases.get(key, ()))
 
     for key, plat in platforms_to_install.items():
         if key == "opencode":
@@ -445,13 +476,13 @@ def install_platform_configs(
             )
             if not changed:
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                _record_configured(key, plat)
                 continue
             if dry_run:
                 print(f"  [dry-run] {plat['name']}: would write {config_path}")
             else:
                 print(f"  {plat['name']}: configured {config_path}")
-            configured.append(plat["name"])
+            _record_configured(key, plat)
             continue
 
         # Read existing config
@@ -505,7 +536,7 @@ def install_platform_configs(
             # Check if already present
             if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in arr):
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                _record_configured(key, plat)
                 continue
             arr_entry = {"name": "code-review-graph", **server_entry}
             arr.append(arr_entry)
@@ -514,7 +545,7 @@ def install_platform_configs(
             servers = existing.get(server_key, {})
             if "code-review-graph" in servers:
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                _record_configured(key, plat)
                 continue
             servers["code-review-graph"] = server_entry
             existing[server_key] = servers
@@ -526,7 +557,7 @@ def install_platform_configs(
             config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
             print(f"  {plat['name']}: configured {config_path}")
 
-        configured.append(plat["name"])
+        _record_configured(key, plat)
 
     return configured
 
@@ -855,21 +886,11 @@ fi
     return hook_path
 
 
-def install_hooks(repo_root: Path, platform: str = "claude") -> None:
-    """Write hooks config to platform-specific settings.json.
-
-    Merges new hook entries into existing settings, preserving both
-    non-hook configuration and user-defined hooks.  A backup of the
-    original file is created before any modifications.
-
-    Args:
-        repo_root: Repository root directory.
-        platform: Target platform ("claude" or "qoder").
-    """
-    if platform == "qoder":
-        settings_dir = repo_root / ".qoder"
-    else:
-        settings_dir = repo_root / ".claude"
+def _merge_hooks_into_settings(
+    settings_dir: Path,
+    hooks_config: dict[str, Any],
+) -> Path:
+    """Merge hook entries into a project settings file without clobbering users."""
     settings_dir.mkdir(parents=True, exist_ok=True)
     settings_path = settings_dir / "settings.json"
 
@@ -883,7 +904,6 @@ def install_hooks(repo_root: Path, platform: str = "claude") -> None:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read existing %s: %s", settings_path, exc)
 
-    hooks_config = generate_hooks_config(repo_root)
     existing_hooks = existing.get("hooks", {})
     if not isinstance(existing_hooks, dict):
         logger.warning("Existing hooks config is not a dict; replacing with defaults")
@@ -904,6 +924,44 @@ def install_hooks(repo_root: Path, platform: str = "claude") -> None:
 
     settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
     logger.info("Wrote hooks config: %s", settings_path)
+    return settings_path
+
+
+def install_hooks(repo_root: Path, platform: str = "claude") -> None:
+    """Write hooks config to platform-specific settings.json.
+
+    Merges new hook entries into existing settings, preserving both
+    non-hook configuration and user-defined hooks.  A backup of the
+    original file is created before any modifications.
+
+    Args:
+        repo_root: Repository root directory.
+        platform: Target platform ("claude" or "qoder").
+    """
+    if platform == "qoder":
+        settings_dir = repo_root / ".qoder"
+    else:
+        settings_dir = repo_root / ".claude"
+    _merge_hooks_into_settings(settings_dir, generate_hooks_config(repo_root))
+
+
+def install_codebuddy_hooks(repo_root: Path) -> Path:
+    """Install runtime-resolved POSIX hooks in .codebuddy/settings.json.
+
+    CodeBuddy uses the same nested hook schema and POSIX-shell execution
+    model as the existing project hooks. The shared generator deliberately
+    resolves the checkout at hook runtime instead of embedding the installer's
+    absolute path, so committed settings work for every collaborator.
+    """
+    hooks_config = generate_hooks_config(repo_root)
+    # CodeBuddy's Bash tool can create or rewrite files without going through
+    # Edit/Write, so its PostToolUse contract also observes Bash. The command
+    # itself still resolves the repository dynamically at hook runtime.
+    hooks_config["hooks"]["PostToolUse"][0]["matcher"] = "Edit|Write|Bash"
+    return _merge_hooks_into_settings(
+        repo_root / ".codebuddy",
+        hooks_config,
+    )
 
 
 def install_codex_hooks(repo_root: Path) -> Path:
@@ -1105,6 +1163,7 @@ _PLATFORM_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
     "QODER.md": ("qoder",),
     ".kiro/steering/code-review-graph.md": ("kiro",),
     ".github/code-review-graph.instruction.md": ("copilot", "copilot-cli"),
+    "CODEBUDDY.md": ("codebuddy",),
 }
 
 
@@ -1261,6 +1320,29 @@ def install_gemini_cli_skills(repo_root: Path) -> Path:
         )
         skill_path.write_text(content, encoding="utf-8")
         logger.info("Wrote Gemini CLI skill: %s", skill_path)
+
+    return skills_root
+
+
+def install_codebuddy_skills(repo_root: Path) -> Path:
+    """Install project skills in .codebuddy/skills/<name>/SKILL.md."""
+    skills_root = repo_root / ".codebuddy" / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+
+    for filename, skill in _SKILLS.items():
+        slug = filename.rsplit(".", 1)[0]
+        skill_dir = skills_root / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+        content = (
+            "---\n"
+            f"name: {slug}\n"
+            f"description: {skill['description']}\n"
+            "---\n\n"
+            f"{skill['body']}\n"
+        )
+        skill_path.write_text(content, encoding="utf-8")
+        logger.info("Wrote CodeBuddy skill: %s", skill_path)
 
     return skills_root
 
