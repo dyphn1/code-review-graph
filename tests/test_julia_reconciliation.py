@@ -53,6 +53,29 @@ def test_operator_definition_uses_operator_name(signature, expected):
     assert [node.name for node in nodes if node.kind == "Function"] == [expected]
 
 
+@pytest.mark.parametrize(
+    ("signature", "expected_name", "expected_parent", "expected_qualifier"),
+    [
+        ("function +(a, b)\n    a\nend", "+", None, None),
+        ("function (==)(a, b)\n    true\nend", "==", None, None),
+        ("function Base.:+(a, b)\n    a\nend", "+", "Base", "Base"),
+        ("function Base.:(==)(a, b)\n    true\nend", "==", "Base", "Base"),
+        ("function A.B.:+(a, b)\n    a\nend", "+", "A.B", "A.B"),
+    ],
+)
+def test_long_form_operator_definition_uses_operator_identity(
+    signature, expected_name, expected_parent, expected_qualifier,
+):
+    nodes, _ = _parse(signature)
+
+    function = next(node for node in nodes if node.kind == "Function")
+    assert (function.name, function.parent_name) == (
+        expected_name,
+        expected_parent,
+    )
+    assert function.extra.get("julia_module_qualifier") == expected_qualifier
+
+
 def test_parameterized_const_only_is_a_type():
     nodes, _ = _parse(
         "const FloatVec = Vector{Float64}\n"
@@ -166,6 +189,72 @@ def test_qualified_calls_keep_full_module_and_resolve_collisions():
     )
 
 
+def test_qualified_method_body_uses_lexical_scope_for_bare_calls():
+    _, edges = _parse(
+        "module Demo\n"
+        "helper() = 1\n"
+        "function Base.helper()\n"
+        "end\n"
+        "function Base.show()\n"
+        "    helper()\n"
+        "    Base.helper()\n"
+        "end\n"
+        "end\n"
+    )
+
+    targets = {
+        edge.target
+        for edge in edges
+        if edge.kind == "CALLS"
+        and edge.source == "/repo/case.jl::Demo.Base.show"
+    }
+    assert targets == {
+        "/repo/case.jl::Demo.helper",
+        "/repo/case.jl::Demo.Base.helper",
+    }
+
+
+def test_wrapped_qualified_signature_is_not_a_self_call():
+    nodes, edges = _parse(
+        "function A.B.f(x)::Int where {T}\n"
+        "    x\n"
+        "end\n"
+    )
+
+    function = next(node for node in nodes if node.kind == "Function")
+    assert (function.name, function.parent_name) == ("f", "A.B")
+    assert not [edge for edge in edges if edge.kind == "CALLS"]
+
+
+def test_nested_function_in_qualified_method_keeps_identity_and_lexical_lookup():
+    nodes, edges = _parse(
+        "module Demo\n"
+        "helper() = 1\n"
+        "function Base.show()\n"
+        "    function inner()\n"
+        "        helper()\n"
+        "    end\n"
+        "    inner()\n"
+        "end\n"
+        "end\n"
+    )
+
+    inner = next(node for node in nodes if node.name == "inner")
+    assert inner.parent_name == "Demo.Base.show"
+    assert any(
+        edge.kind == "CALLS"
+        and edge.source == "/repo/case.jl::Demo.Base.show.inner"
+        and edge.target == "/repo/case.jl::Demo.helper"
+        for edge in edges
+    )
+    assert any(
+        edge.kind == "CALLS"
+        and edge.source == "/repo/case.jl::Demo.Base.show"
+        and edge.target == "/repo/case.jl::Demo.Base.show.inner"
+        for edge in edges
+    )
+
+
 def test_nested_modules_and_functions_keep_complete_scope():
     nodes, edges = _parse(
         "module Outer\n"
@@ -234,6 +323,39 @@ def test_calls_through_import_aliases_use_real_module_paths():
         and edge.target == "OtherFrames.transform"
         and edge.extra.get("julia_call_module") == "OtherFrames"
         for edge in calls
+    )
+
+
+def test_selected_import_alias_keeps_multi_segment_module_path():
+    _, edges = _parse(
+        "module Demo\n"
+        "import Foo.Bar: thing as alias\n"
+        "f() = alias()\n"
+        "end\n"
+    )
+
+    assert any(
+        edge.kind == "CALLS"
+        and edge.source == "/repo/case.jl::Demo.f"
+        and edge.target == "Foo.Bar.thing"
+        for edge in edges
+    )
+
+
+def test_enum_variants_use_the_full_lexical_type_parent():
+    nodes, edges = _parse("module Demo\n@enum Color RED\nend\n")
+
+    variant = next(
+        node
+        for node in nodes
+        if node.extra.get("julia_kind") == "enum_variant"
+    )
+    assert (variant.name, variant.parent_name) == ("RED", "Demo.Color")
+    assert any(
+        edge.kind == "CONTAINS"
+        and edge.source == "/repo/case.jl::Demo.Color"
+        and edge.target == "/repo/case.jl::Demo.Color.RED"
+        for edge in edges
     )
 
 

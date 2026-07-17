@@ -2492,15 +2492,65 @@ class CodeParser:
         file_path: str,
     ) -> list[EdgeInfo]:
         """Resolve Julia calls from the nearest lexical scope outward."""
-        symbols: dict[str, str] = {}
         prefix = f"{file_path}::"
+
+        # Qualified definitions have two paths: an identity path retaining
+        # the explicit qualifier (``Demo.Base.show``), and a lexical path
+        # used for bare-name lookup inside the body (``Demo.show``). Build
+        # prefix rewrites so descendants of qualified methods inherit the
+        # lexical path without losing their collision-free stored identity.
+        lexical_rewrites: list[tuple[str, str]] = []
+        for node in nodes:
+            qualifier = node.extra.get("julia_module_qualifier")
+            if not isinstance(qualifier, str) or not qualifier:
+                continue
+            identity_parent = node.parent_name or ""
+            parent_parts = identity_parent.split(".") if identity_parent else []
+            qualifier_parts = qualifier.split(".")
+            if parent_parts[-len(qualifier_parts):] != qualifier_parts:
+                continue
+            lexical_parent = ".".join(
+                parent_parts[:-len(qualifier_parts)],
+            )
+            identity_path = ".".join(
+                part for part in (identity_parent, node.name) if part
+            )
+            lexical_path = ".".join(
+                part for part in (lexical_parent, node.name) if part
+            )
+            lexical_rewrites.append((identity_path, lexical_path))
+        lexical_rewrites.sort(key=lambda item: len(item[0]), reverse=True)
+
+        def _lexical_path(identity_path: str) -> str:
+            result = identity_path
+            for _ in range(len(lexical_rewrites) + 1):
+                updated = result
+                for identity_prefix, lexical_prefix in lexical_rewrites:
+                    if result == identity_prefix:
+                        updated = lexical_prefix
+                        break
+                    if result.startswith(f"{identity_prefix}."):
+                        updated = f"{lexical_prefix}{result[len(identity_prefix):]}"
+                        break
+                if updated == result:
+                    return result
+                result = updated
+            return result
+
+        symbols: dict[str, str] = {}
         for node in nodes:
             if node.kind not in ("Function", "Class", "Type", "Test"):
                 continue
             qualified = self._qualify(
                 node.name, file_path, node.parent_name,
             )
-            symbols[qualified.removeprefix(prefix)] = qualified
+            identity_path = qualified.removeprefix(prefix)
+            if node.extra.get("julia_module_qualifier"):
+                # A qualified method is only reachable through its explicit
+                # module path; it does not create a bare lexical binding.
+                symbols[identity_path] = qualified
+            else:
+                symbols[_lexical_path(identity_path)] = qualified
 
         resolved: list[EdgeInfo] = []
         for edge in edges:
@@ -2522,6 +2572,7 @@ class CodeParser:
                 if edge.source.startswith(prefix)
                 else ""
             )
+            source_tail = _lexical_path(source_tail)
             scope_parts = source_tail.split(".") if source_tail else []
             target = None
             for size in range(len(scope_parts), -1, -1):
@@ -3586,6 +3637,18 @@ class CodeParser:
                 return import_map[key]
         return None
 
+    @staticmethod
+    def _julia_call_is_in_signature(call_node) -> bool:
+        """Return whether a Julia call belongs to a wrapped signature."""
+        parent = call_node.parent
+        while parent is not None:
+            if parent.type == "signature":
+                return True
+            if parent.type in ("block", "source_file"):
+                return False
+            parent = parent.parent
+        return False
+
     def _julia_short_func_name(self, call_expr) -> Optional[str]:
         """Extract the name from a ``call_expression`` that is the LHS of
         a short-form function ``f(x) = expr`` or ``Base.f(x) = expr`` or
@@ -3793,10 +3856,11 @@ class CodeParser:
         # --- Skip call_expression nodes that are actually function
         # signatures (``function foo(x) ... end`` has a ``signature >
         # call_expression`` that describes the definition, not a call).
-        if node_type == "call_expression":
-            parent = child.parent
-            if parent is not None and parent.type == "signature":
-                return True
+        if (
+            node_type == "call_expression"
+            and self._julia_call_is_in_signature(child)
+        ):
+            return True
 
         # --- include("file.jl") -> IMPORTS_FROM edge ---
         if node_type == "call_expression":
@@ -3912,8 +3976,11 @@ class CodeParser:
                         vname = variant.text.decode(
                             "utf-8", errors="replace",
                         )
+                        variant_parent = self._julia_scope_join(
+                            enclosing_class, type_name,
+                        )
                         qualified_v = self._qualify(
-                            vname, file_path, type_name,
+                            vname, file_path, variant_parent,
                         )
                         nodes.append(NodeInfo(
                             kind="Function",
@@ -3922,7 +3989,7 @@ class CodeParser:
                             line_start=variant.start_point[0] + 1,
                             line_end=variant.end_point[0] + 1,
                             language=language,
-                            parent_name=type_name,
+                            parent_name=variant_parent,
                             extra={"julia_kind": "enum_variant"},
                         ))
                         edges.append(EdgeInfo(
@@ -7141,6 +7208,14 @@ class CodeParser:
                         module_name = part.text.decode(
                             "utf-8", errors="replace",
                         )
+                    elif not seen_colon and part.type == "import_path":
+                        module_name = ".".join(
+                            component.text.decode(
+                                "utf-8", errors="replace",
+                            )
+                            for component in part.children
+                            if component.type == "identifier"
+                        )
                     elif seen_colon and part.type == "import_alias":
                         real_name, alias = _alias_parts(part)
                         if module_name and real_name and alias:
@@ -7842,50 +7917,21 @@ class CodeParser:
         # ``parametrized_type_expression`` (``{T}``).
         if language == "julia":
             if node.type in ("function_definition", "macro_definition"):
-                for child in node.children:
-                    if child.type == "signature":
-                        call = child
-                        # Unwrap where_expression: signature > where_expression > call_expression
-                        for sub in call.children:
-                            if sub.type == "where_expression":
-                                call = sub
-                                break
-                        # Unwrap typed_expression: signature > typed_expression > call_expression
-                        # (``function foo(x)::ReturnType``)
-                        for sub in call.children:
-                            if sub.type == "typed_expression":
-                                call = sub
-                                break
-                        for sub in call.children:
-                            if sub.type == "call_expression":
-                                for target in sub.children:
-                                    if target.type == "identifier":
-                                        return target.text.decode(
-                                            "utf-8", errors="replace",
-                                        )
-                                    if target.type == "field_expression":
-                                        # Qualified: last identifier is method name
-                                        for ident in reversed(target.children):
-                                            if ident.type == "identifier":
-                                                return ident.text.decode(
-                                                    "utf-8", errors="replace",
-                                                )
-                                    if target.type == "parametrized_type_expression":
-                                        # Parametric constructor: Foo{T}(x) = ...
-                                        for p in target.children:
-                                            if p.type == "identifier":
-                                                return p.text.decode(
-                                                    "utf-8", errors="replace",
-                                                )
-                                return None
-                        # Generic-function stub: ``function foo end`` has a
-                        # direct identifier in the signature and no call.
-                        for sub in call.children:
-                            if sub.type == "identifier":
-                                return sub.text.decode(
-                                    "utf-8", errors="replace",
-                                )
-                return None
+                callee = self._julia_signature_callee(node)
+                if callee is None:
+                    return None
+                if callee.type == "field_expression":
+                    _, name = self._julia_field_info(callee)
+                    return name
+                if callee.type == "parametrized_type_expression":
+                    # Parametric constructor: ``Foo{T}(x)``.
+                    for part in callee.children:
+                        if part.type == "identifier":
+                            return part.text.decode(
+                                "utf-8", errors="replace",
+                            )
+                    return None
+                return self._julia_component_name(callee)
             if node.type in ("struct_definition", "abstract_definition"):
                 for child in node.children:
                     if child.type == "type_head":
