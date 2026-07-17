@@ -214,6 +214,41 @@ def test_qualified_method_body_uses_lexical_scope_for_bare_calls():
     }
 
 
+def test_nested_symbols_do_not_collide_between_local_and_qualified_methods():
+    nodes, edges = _parse(
+        "module Demo\n"
+        "function show()\n"
+        "    inner() = 1\n"
+        "    inner()\n"
+        "end\n"
+        "function Base.show()\n"
+        "    inner() = 2\n"
+        "    inner()\n"
+        "end\n"
+        "end\n"
+    )
+
+    assert {
+        (node.name, node.parent_name)
+        for node in nodes
+        if node.name == "inner"
+    } == {
+        ("inner", "Demo.show"),
+        ("inner", "Demo.Base.show"),
+    }
+    calls = [edge for edge in edges if edge.kind == "CALLS"]
+    assert any(
+        edge.source == "/repo/case.jl::Demo.show"
+        and edge.target == "/repo/case.jl::Demo.show.inner"
+        for edge in calls
+    )
+    assert any(
+        edge.source == "/repo/case.jl::Demo.Base.show"
+        and edge.target == "/repo/case.jl::Demo.Base.show.inner"
+        for edge in calls
+    )
+
+
 def test_wrapped_qualified_signature_is_not_a_self_call():
     nodes, edges = _parse(
         "function A.B.f(x)::Int where {T}\n"
@@ -224,6 +259,23 @@ def test_wrapped_qualified_signature_is_not_a_self_call():
     function = next(node for node in nodes if node.kind == "Function")
     assert (function.name, function.parent_name) == ("f", "A.B")
     assert not [edge for edge in edges if edge.kind == "CALLS"]
+
+
+def test_wrapped_signature_keeps_evaluated_return_type_call():
+    _, edges = _parse(
+        "g() = Int\n"
+        "function f(x)::g()\n"
+        "    x\n"
+        "end\n"
+    )
+
+    calls = [edge for edge in edges if edge.kind == "CALLS"]
+    assert not any(edge.target == "/repo/case.jl::f" for edge in calls)
+    assert any(
+        edge.source == "/repo/case.jl::f"
+        and edge.target == "/repo/case.jl::g"
+        for edge in calls
+    )
 
 
 def test_nested_function_in_qualified_method_keeps_identity_and_lexical_lookup():

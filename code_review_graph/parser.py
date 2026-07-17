@@ -2494,12 +2494,11 @@ class CodeParser:
         """Resolve Julia calls from the nearest lexical scope outward."""
         prefix = f"{file_path}::"
 
-        # Qualified definitions have two paths: an identity path retaining
-        # the explicit qualifier (``Demo.Base.show``), and a lexical path
-        # used for bare-name lookup inside the body (``Demo.show``). Build
-        # prefix rewrites so descendants of qualified methods inherit the
-        # lexical path without losing their collision-free stored identity.
-        lexical_rewrites: list[tuple[str, str]] = []
+        # Qualified methods retain their explicit identity path, but that
+        # module qualifier is not a lexical parent. Record the method
+        # boundary and the scope to jump to after searching definitions
+        # nested inside that exact method body.
+        qualified_boundaries: list[tuple[str, str]] = []
         for node in nodes:
             qualifier = node.extra.get("julia_module_qualifier")
             if not isinstance(qualifier, str) or not qualifier:
@@ -2515,27 +2514,10 @@ class CodeParser:
             identity_path = ".".join(
                 part for part in (identity_parent, node.name) if part
             )
-            lexical_path = ".".join(
-                part for part in (lexical_parent, node.name) if part
-            )
-            lexical_rewrites.append((identity_path, lexical_path))
-        lexical_rewrites.sort(key=lambda item: len(item[0]), reverse=True)
-
-        def _lexical_path(identity_path: str) -> str:
-            result = identity_path
-            for _ in range(len(lexical_rewrites) + 1):
-                updated = result
-                for identity_prefix, lexical_prefix in lexical_rewrites:
-                    if result == identity_prefix:
-                        updated = lexical_prefix
-                        break
-                    if result.startswith(f"{identity_prefix}."):
-                        updated = f"{lexical_prefix}{result[len(identity_prefix):]}"
-                        break
-                if updated == result:
-                    return result
-                result = updated
-            return result
+            qualified_boundaries.append((identity_path, lexical_parent))
+        qualified_boundaries.sort(
+            key=lambda item: len(item[0]), reverse=True,
+        )
 
         symbols: dict[str, str] = {}
         for node in nodes:
@@ -2545,12 +2527,34 @@ class CodeParser:
                 node.name, file_path, node.parent_name,
             )
             identity_path = qualified.removeprefix(prefix)
-            if node.extra.get("julia_module_qualifier"):
-                # A qualified method is only reachable through its explicit
-                # module path; it does not create a bare lexical binding.
-                symbols[identity_path] = qualified
-            else:
-                symbols[_lexical_path(identity_path)] = qualified
+            symbols[identity_path] = qualified
+
+        def _search_scopes(
+            source_scope: str,
+            seen: frozenset[str] = frozenset(),
+        ):
+            if source_scope in seen:
+                return
+            next_seen = seen | {source_scope}
+            boundary = next(
+                (
+                    item for item in qualified_boundaries
+                    if source_scope == item[0]
+                    or source_scope.startswith(f"{item[0]}.")
+                ),
+                None,
+            )
+            scope_parts = source_scope.split(".") if source_scope else []
+            if boundary is None:
+                for size in range(len(scope_parts), -1, -1):
+                    yield ".".join(scope_parts[:size])
+                return
+
+            identity_boundary, lexical_parent = boundary
+            boundary_depth = len(identity_boundary.split("."))
+            for size in range(len(scope_parts), boundary_depth - 1, -1):
+                yield ".".join(scope_parts[:size])
+            yield from _search_scopes(lexical_parent, next_seen)
 
         resolved: list[EdgeInfo] = []
         for edge in edges:
@@ -2572,11 +2576,8 @@ class CodeParser:
                 if edge.source.startswith(prefix)
                 else ""
             )
-            source_tail = _lexical_path(source_tail)
-            scope_parts = source_tail.split(".") if source_tail else []
             target = None
-            for size in range(len(scope_parts), -1, -1):
-                scope = ".".join(scope_parts[:size])
+            for scope in _search_scopes(source_tail):
                 candidate = f"{scope}.{edge.target}" if scope else edge.target
                 target = symbols.get(candidate)
                 if target is not None:
@@ -3555,8 +3556,8 @@ class CodeParser:
             return inner
         return f"{outer}.{inner}"
 
-    def _julia_signature_callee(self, function_node):
-        """Return the definition target inside a Julia signature."""
+    def _julia_signature_call(self, function_node):
+        """Return the outer definition call inside a Julia signature."""
         signature = next(
             (
                 child for child in function_node.children
@@ -3576,18 +3577,7 @@ class CodeParser:
                 None,
             )
             if call is not None:
-                return call.children[0] if call.children else None
-            direct = next(
-                (
-                    child for child in scope.children
-                    if child.type in (
-                        "field_expression", "identifier", "operator",
-                    )
-                ),
-                None,
-            )
-            if direct is not None:
-                return direct
+                return call
             wrapper = next(
                 (
                     child for child in scope.children
@@ -3601,6 +3591,30 @@ class CodeParser:
                 break
             scope = wrapper
         return None
+
+    def _julia_signature_callee(self, function_node):
+        """Return the definition target inside a Julia signature."""
+        call = self._julia_signature_call(function_node)
+        if call is not None:
+            return call.children[0] if call.children else None
+        signature = next(
+            (
+                child for child in function_node.children
+                if child.type == "signature"
+            ),
+            None,
+        )
+        if signature is None:
+            return None
+        return next(
+            (
+                child for child in signature.children
+                if child.type in (
+                    "field_expression", "identifier", "operator",
+                )
+            ),
+            None,
+        )
 
     def _julia_definition_qualifier(
         self, function_node,
@@ -3637,15 +3651,14 @@ class CodeParser:
                 return import_map[key]
         return None
 
-    @staticmethod
-    def _julia_call_is_in_signature(call_node) -> bool:
-        """Return whether a Julia call belongs to a wrapped signature."""
+    def _julia_call_is_in_signature(self, call_node) -> bool:
+        """Return whether this is the signature's definition call."""
         parent = call_node.parent
         while parent is not None:
-            if parent.type == "signature":
-                return True
-            if parent.type in ("block", "source_file"):
-                return False
+            if parent.type in ("function_definition", "macro_definition"):
+                return self._julia_signature_call(parent) == call_node
+            if parent.type == "source_file":
+                break
             parent = parent.parent
         return False
 
